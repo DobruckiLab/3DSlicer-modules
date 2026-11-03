@@ -1,0 +1,199 @@
+"""GUI for the Radiomics Heterogeneity module.
+
+Implements the ``RadiomicsHeterogeneityGUI`` class used by the Slicer
+module scaffolding.  Provides a Qt widget with:
+- Volume / segmentation selectors
+- Gray-level bin count
+- Compute button
+- Results table (read-only)
+- Export-to-CSV button
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import qt
+
+
+class RadiomicsHeterogeneityGUI:
+    """Widget for the Radiomics Heterogeneity module."""
+
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.logic = None  # set by Module.setup
+
+        # ── Layout ──────────────────────────────────────────────
+        self.widget = qt.QWidget(parent)
+        self.layout = qt.QVBoxLayout(self.widget)
+        self.layout.setContentsMargins(4, 4, 4, 4)
+
+        # Collapsible parameter panel
+        self.paramsCollapsibleButton = qt.QCollapsibleButton("Parameters")
+        self.paramsCollapsibleButton.setMaximumWidth(350)
+        self.layout.addWidget(self.paramsCollapsibleButton)
+        self.paramsFormLayout = qt.QFormLayout(self.paramsCollapsibleButton)
+
+        # Volume selector
+        self.volumeSelector = qt.QComboBox()
+        self.volumeSelector.connect("currentIndexChanged(int)", self._onVolumeChanged)
+        self.paramsFormLayout.addRow("Volume:", self.volumeSelector)
+
+        # Segmentation selector
+        self.segmentationSelector = qt.QComboBox()
+        self.segmentationSelector.connect(
+            "currentIndexChanged(int)", self._onSegmentationChanged
+        )
+        self.paramsFormLayout.addRow("Segmentation:", self.segmentationSelector)
+
+        # Gray levels bin count (dropdown)
+        self.grayLevelsComboBox = qt.QComboBox()
+        self.grayLevelsComboBox.addItems(["8", "16", "32", "64"])
+        self.grayLevelsComboBox.setCurrentIndex(3)  # default: 64
+        self.paramsFormLayout.addRow("Gray Levels:", self.grayLevelsComboBox)
+
+        # Compute button
+        self.computeButton = qt.QPushButton("Compute Features")
+        self.computeButton.enabled = True
+        self.computeButton.connect("clicked()", self._onCompute)
+        self.paramsFormLayout.addRow(self.computeButton)
+
+        # Progress bar
+        self.progressBar = qt.QProgressBar()
+        self.progressBar.visible = False
+        self.layout.addWidget(self.progressBar)
+
+        # ── Results section ─────────────────────────────────────
+        self.resultsCollapsibleButton = qt.QCollapsibleButton("Results")
+        self.resultsCollapsibleButton.setMaximumWidth(350)
+        self.layout.addWidget(self.resultsCollapsibleButton)
+        self.resultsFormLayout = qt.QFormLayout(self.resultsCollapsibleButton)
+
+        self.resultsTable = qt.QTableWidget()
+        self.resultsTable.maximumHeight = 400
+        self.resultsTable.horizontalHeader().stretchLastSection = True
+        self.resultsFormLayout.addRow(self.resultsTable)
+
+        # Export button
+        self.exportButton = qt.QPushButton("Export CSV")
+        self.exportButton.enabled = False
+        self.exportButton.connect("clicked()", self._onExport)
+        self.resultsFormLayout.addRow(self.exportButton)
+
+        # ── Status ──────────────────────────────────────────────
+        self.statusLabel = qt.QLabel("")
+        self.statusLabel.maximumWidth = 350
+        self.layout.addWidget(self.statusLabel)
+
+        # Populated by Module.setup
+        self._volumeNodes: list = []
+        self._segmentationNodes: list = []
+        self._results: dict[str, float] = {}
+
+    # ── Population helpers ────────────────────────────────────────
+
+    def populateVolumeSelector(self, nodes):
+        """Fill the volume combo box from a list of ``vtkMRMLScalarVolumeNode``."""
+        self._volumeNodes = nodes
+        self.volumeSelector.clear()
+        for node in nodes:
+            self.volumeSelector.addItem(node.GetName())
+        if len(nodes) > 0:
+            self.volumeSelector.current_index = 0
+
+    def populateSegmentationSelector(self, nodes):
+        """Fill the segmentation combo box from a list of ``vtkMRMLSegmentationNode``."""
+        self._segmentationNodes = nodes
+        self.segmentationSelector.clear()
+        for node in nodes:
+            self.segmentationSelector.addItem(node.GetName())
+        if len(nodes) > 0:
+            self.segmentationSelector.current_index = 0
+
+    # ── Callbacks ─────────────────────────────────────────────────
+
+    def _onVolumeChanged(self):
+        self.statusLabel.text = "Volume changed."
+
+    def _onSegmentationChanged(self):
+        self.statusLabel.text = "Segmentation changed."
+
+    def _onCompute(self):
+        self.statusLabel.text = "Computing features..."
+        self.progressBar.visible = True
+        self.computeButton.enabled = False
+
+        import slicer
+
+        volume_node = self._volumeNodes[self.volumeSelector.current_index]
+        seg_node = self._segmentationNodes[self.segmentationSelector.current_index]
+        num_levels = int(self.grayLevelsComboBox.currentText)
+
+        try:
+            features = self.logic.compute_all_features(
+                volume_node, seg_node, num_levels=num_levels
+            )
+            self._display_results(features)
+            self.statusLabel.text = f"Done — {len(features)} features computed."
+        except Exception as exc:
+            self.statusLabel.text = f"Error: {exc}"
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.progressBar.visible = False
+            self.computeButton.enabled = True
+
+    def _display_results(self, features: dict[str, float]):
+        self._results = features
+        self.exportButton.enabled = True
+        self.resultsTable.clear()
+        self.resultsTable.columnCount = 2
+        self.resultsTable.verticalHeader().visible = False
+        self.resultsTable.setHorizontalHeaderLabels(["Feature", "Value"])
+
+        row = 0
+        for key, val in features.items():
+            self.resultsTable.insert_row(row)
+            name_item = qt.QTableWidgetItem(key)
+            name_item.read_only = True
+            self.resultsTable.setItem(row, 0, name_item)
+
+            if isinstance(val, float):
+                text = f"{val:.6g}"
+            else:
+                text = str(val)
+            value_item = qt.QTableWidgetItem(text)
+            value_item.read_only = True
+            self.resultsTable.setItem(row, 1, value_item)
+            row += 1
+
+        self.resultsTable.resize_columns_to_contents()
+
+    def _onExport(self):
+        import slicer
+
+        if not self._results:
+            return
+
+        # Ask user where to save
+        path = slicer.util.saveFileName(
+            filter="CSV (*.csv)",
+            initialDirectory=slicer.app.userSettingsValue("RadiomicsHeterogeneity/LastExportDir"),
+        )
+        if not path:
+            return
+
+        slicer.app.userSettingsValue(
+            "RadiomicsHeterogeneity/LastExportDir",
+            str(path.rsplit("/", 1)[0]),
+        )
+
+        with open(path, "w") as f:
+            f.write("Feature,Value\n")
+            for key, val in self._results.items():
+                if isinstance(val, float):
+                    f.write(f"{key},{val:.10g}\n")
+                else:
+                    f.write(f"{key},{val}\n")
+
+        self.statusLabel.text = f"Saved to {path}"

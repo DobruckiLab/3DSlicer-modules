@@ -21,16 +21,33 @@ Quantifies **every frame** of a dynamic PET sequence against a pre-defined segme
 
 ---
 
-### [SiemensImporter](SiemensImporter/)
+### [PADAnalysis](PADAnalysis/)
 
-Imports **Siemens Inveon** preclinical PET/CT datasets (`.img` / `.img.hdr`) and converts them to NIfTI format, with full support for multi-frame dynamic acquisitions.
+Splits a manually-drawn whole-hindlimb CT segmentation (left and/or right leg) into three anatomical zones — **Proximal**, **Distal**, and **Foot** — using cut-off planes positioned interactively on the CT (hip/upper-thigh boundary, knee joint, ankle joint), then quantifies PET tracer uptake in each zone.
 
-- Parses Inveon ASCII headers and binary image data
-- Handles PET (float32) and CT (int16 / Hounsfield Units) modalities
-- Applies per-frame scale factors and optional scanner calibration
-- Converts from LPS scanner coordinates to Slicer RAS automatically
+- Interactive Markups plane widgets for the three per-leg cut-off boundaries, dragged directly onto the CT image
+- Voxel-level classification against the planes (numpy), independent of plane orientation
+- Generates six zone segments (`Left_Proximal`, `Left_Distal`, `Left_Foot`, `Right_Proximal`, `Right_Distal`, `Right_Foot`) in an output segmentation
+- Quantifies PET uptake per zone via SegmentStatistics and exports a structured CSV
 
-**Module location in Slicer:** `Modules → Utilities → Siemens Inveon Importer`
+**Module location in Slicer:** `Modules → Quantification → PAD Analysis`
+
+---
+
+### [RadiomicsHeterogeneity](RadiomicsHeterogeneity/)
+
+Extracts **54 IBSI-standardised 3D radiomics features** from a CT or PET volume using a segmentation, capturing tumour heterogeneity through first-order statistics, co-occurrence, run-length, grey-level zone, and neighbourhood grey-level difference matrices — all computed in 3D.
+
+- **First-order** (19): mean, std dev, skewness, kurtosis, entropy, percentiles, and more
+- **3D GLCM** (8): contrast, correlation, energy, homogeneity, entropy, and information measures
+- **3D GLRLM** (10): run-length emphasis, short/long run emphasis, grey-level non-uniformity
+- **3D GLZDM** (5): dependence emphasis, dependence percent, dependence entropy
+- **NGTDM** (5): coarseness, contrast, complexity, strength, granularity
+- **Morphometry** (7): voxel count, volume, bounding box, compactness, sphericity
+- User-selectable grey-level quantisation (8, 16, 32, or 64 bins) for texture features
+- Results table with one-click CSV export
+
+**Module location in Slicer:** `Modules → Quantification → Radiomics Heterogeneity`
 
 ---
 
@@ -46,6 +63,32 @@ Built-in steps include registration (BRAINSFit), N4 bias correction, Gaussian an
 - Extensible via a `STEP_CATALOGUE` dictionary
 
 **Module location in Slicer:** `Modules → Utilities → Workflow`
+
+---
+
+### [SiemensImporter](SiemensImporter/)
+
+Imports **Siemens Inveon** preclinical PET/CT datasets (`.img` / `.img.hdr`) and converts them to NIfTI format, with full support for multi-frame dynamic acquisitions.
+
+- Parses Inveon ASCII headers and binary image data
+- Handles PET (float32) and CT (int16 / Hounsfield Units) modalities
+- Applies per-frame scale factors and optional scanner calibration
+- Converts from LPS scanner coordinates to Slicer RAS automatically
+
+**Module location in Slicer:** `Modules → Utilities → Siemens Inveon Importer`
+
+---
+
+### [SupertoroidalGlyphs](SupertoroidalGlyphs/)
+
+Generates **supertoroidal glyph fields** from co-registered imaging data (e.g. CT + PET) and displays them as parameter-mapped 3D glyphs overlaid on a reference volume — visualising multi-parametric relationships in anatomical context.
+
+- Map up to four co-registered volumes to glyph parameters: **color**, **N1**, **N2**, and **size**
+- Configurable binning factor (NxNxN voxel blocks averaged into one glyph) for performance
+- Each glyph's shape and appearance encodes the underlying multi-parametric data
+- Export glyph table as CSV with spatial coordinates and all parameter values
+
+**Module location in Slicer:** `Modules → Informatics → Supertoroidal Glyphs`
 
 ---
 

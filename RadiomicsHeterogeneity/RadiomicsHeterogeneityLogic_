@@ -1,0 +1,787 @@
+"""Core radiomics heterogeneity computation logic.
+
+All features are computed in 3D over voxels defined by a segment mask.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+
+def _clip_array(arr: np.ndarray) -> np.ndarray:
+    """Cast to uint16 to avoid memory issues with very large arrays."""
+    return arr.astype(np.int32, copy=False)
+
+
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
+
+def extract_mask_and_intensity(
+    volume_node,
+    segment_node,
+):
+    """Extract a 3D intensity array masked by the given segment.
+
+    Parameters
+    ----------
+    volume_node :
+        A ``vtkMRMLScalarVolumeNode`` or ``vtkMRMLVolumeNode``.
+    segment_node :
+        A ``vtkMRMLSegmentationNode`` whose first segment is used.
+
+    Returns
+    -------
+    tuple of (mask_3d, intensity_3d, shape, spacing)
+        ``mask_3d`` is a boolean array; ``intensity_3d`` is the volume data
+        restricted to the same geometry.
+    """
+    import slicer
+    import vtk
+
+    # Get volume data
+    volume_array = slicer.util.array(volume_node)
+    shape = volume_array.shape  # (X, Y, Z)
+    spacing = volume_node.GetSpacing()
+
+    # Get segmentation -> first segment -> binary labelmap in volume space
+    segmentation = segment_node.GetSegmentation()
+    segment_id = segmentation.GetSegmentIdBySegmentNumber(0)
+    segment = segmentation.GetSegment(segment_id)
+
+    # Convert segment to binary labelmap
+    binary_labelmap = vtk.vtkSegmentationConverter.ExtractBinaryLabelmap(
+        segment_node.GetSegmentation(), segment_id, volume_node
+    )
+    mask_array = slicer.util.arrayFromVolumeBinaryLabelmap(binary_labelmap)
+
+    return mask_array.astype(bool), volume_array.astype(np.float64), shape, spacing
+
+
+# ---------------------------------------------------------------------------
+# First-order features
+# ---------------------------------------------------------------------------
+
+def compute_first_order(values: np.ndarray) -> dict[str, float]:
+    """Compute first-order intensity statistics."""
+    if values.size == 0:
+        return {k: 0.0 for k in FIRST_ORDER_KEYS}
+
+    n = len(values)
+    sorted_vals = np.sort(values)
+
+    features: dict[str, float] = {}
+    features["firstorder_Count"] = float(n)
+    features["firstorder_Mean"] = float(np.mean(values))
+    features["firstorder_StdDev"] = float(np.std(values, ddof=0))
+    features["firstorder_Variance"] = float(np.var(values, ddof=0))
+    features["firstorder_Median"] = float(np.median(values))
+    features["firstorder_Minimum"] = float(np.min(values))
+    features["firstorder_Maximum"] = float(np.max(values))
+    features["firstorder_Range"] = features["firstorder_Maximum"] - features["firstorder_Minimum"]
+    features["firstorder_InterquartileRange"] = float(
+        np.percentile(values, 75) - np.percentile(values, 25)
+    )
+    features["firstorder_P5"] = float(np.percentile(values, 5))
+    features["firstorder_P25"] = float(np.percentile(values, 25))
+    features["firstorder_P75"] = float(np.percentile(values, 75))
+    features["firstorder_P95"] = float(np.percentile(values, 95))
+    features["firstorder_MeanAbsoluteDeviation"] = float(
+        np.median(np.abs(values - np.median(values)))
+    )
+    features["firstorder_Skewness"] = float(scipy_stats_skew(values))
+    features["firstorder_Kurtosis"] = float(scipy_stats_kurtosis(values, fisher=True))
+    features["firstorder_Entropy"] = float(compute_shannon_entropy(values))
+    features["firstorder_CoV"] = (
+        features["firstorder_StdDev"] / features["firstorder_Mean"]
+        if features["firstorder_Mean"] != 0
+        else 0.0
+    )
+    features["firstorder_RobustSpreadEstimator"] = (
+        features["firstorder_InterquartileRange"] / features["firstorder_Median"]
+        if features["firstorder_Median"] != 0
+        else 0.0
+    )
+    return features
+
+
+# Need scipy for skewness/kurtosis — import lazily
+try:
+    from scipy import stats as scipy_stats
+    def scipy_stats_skew(a):
+        return float(scipy_stats.skew(a, bias=False))
+
+    def scipy_stats_kurtosis(a, fisher=True):
+        return float(scipy_stats.kurtosis(a, fisher=fisher))
+except ImportError:
+    def scipy_stats_skew(a):
+        m = np.mean(a)
+        s = np.std(a, ddof=0)
+        if s == 0:
+            return 0.0
+        return float(np.mean(((a - m) / s) ** 3) * n * (n - 1)) / ((n - 2) * (n - 3) / (n * (n + 1)))
+    # fallback kurtosis using sample formula
+    def scipy_stats_kurtosis(a, fisher=True):
+        m = np.mean(a)
+        s = np.std(a, ddof=0)
+        if s == 0:
+            return 0.0
+        k = float(np.mean(((a - m) / s) ** 4))
+        # excess kurtosis correction
+        correction = (3.0 * (n - 1) ** 2) / ((n - 2) * (n - 3)) if n > 3 else 0
+        return k - 3 + correction if fisher else k
+
+
+FIRST_ORDER_KEYS = [
+    "firstorder_Count",
+    "firstorder_Mean", "firstorder_StdDev", "firstorder_Variance",
+    "firstorder_Median", "firstorder_Minimum", "firstorder_Maximum",
+    "firstorder_Range", "firstorder_InterquartileRange",
+    "firstorder_P5", "firstorder_P25", "firstorder_P75", "firstorder_P95",
+    "firstorder_MeanAbsoluteDeviation",
+    "firstorder_Skewness", "firstorder_Kurtosis", "firstorder_Entropy",
+    "firstorder_CoV", "firstorder_RobustSpreadEstimator",
+]
+
+
+# ---------------------------------------------------------------------------
+# Morphological features
+# ---------------------------------------------------------------------------
+
+def compute_morphological(shape: tuple, spacing, mask: np.ndarray) -> dict[str, float]:
+    """Compute shape-related metrics from the binary mask."""
+    voxel_volume = float(np.prod(spacing))
+    count = int(np.sum(mask))
+    volume_mm3 = count * voxel_volume
+
+    # Bounding box
+    nz, ny, nx = np.where(mask)
+    if count == 0:
+        return {
+            "morphometry_VoxelCount": 0,
+            "morphometry_Volume_mm3": 0.0,
+            "morphometry_BoundingBox_X_mm": 0.0,
+            "morphometry_BoundingBox_Y_mm": 0.0,
+            "morphometry_BoundingBox_Z_mm": 0.0,
+            "morphometry_Compactness": 0.0,
+            "morphometry_Sphericity": 0.0,
+        }
+
+    bb_x = (nx.max() - nx.min() + 1) * spacing[0]
+    bb_y = (ny.max() - ny.min() + 1) * spacing[1]
+    bb_z = (nz.max() - nz.min() + 1) * spacing[2]
+
+    # Compactness = surface_area_of_bbox / (6 * volume)  (1 = perfect cube)
+    bb_surface = 2 * (bb_x * bb_y + bb_y * bb_z + bb_x * bb_z)
+    compactness = bb_surface / (6.0 * volume_mm3) if volume_mm3 > 0 else 0.0
+
+    # Sphericity = (pi^(1/3) * (6*V)^(2/3)) / A_bbox
+    # where A_bbox = bb_surface
+    sphericity = (
+        (np.pi ** (1 / 3)) * (6 * volume_mm3) ** (2 / 3) / bb_surface
+        if bb_surface > 0
+        else 0.0
+    )
+
+    return {
+        "morphometry_VoxelCount": count,
+        "morphometry_Volume_mm3": volume_mm3,
+        "morphometry_BoundingBox_X_mm": bb_x,
+        "morphometry_BoundingBox_Y_mm": bb_y,
+        "morphometry_BoundingBox_Z_mm": bb_z,
+        "morphometry_Compactness": compactness,
+        "morphometry_Sphericity": sphericity,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GLCM (3D)
+# ---------------------------------------------------------------------------
+
+def _compute_3d_glcms(
+    intensity: np.ndarray,
+    mask: np.ndarray,
+    num_levels: int,
+) -> list[np.ndarray]:
+    """Compute 3D GLCM for each unique direction.
+
+    Returns a list of GLCM matrices (one per direction), each of shape
+    (num_levels, num_levels).  Uses only positive shifts since GLCM pairs
+    are undirected (we count both (i,j) and (j,i) implicitly by using
+    positive offsets only).
+    """
+    # Quantize
+    vmin, vmax = intensity[mask].min(), intensity[mask].max()
+    if vmax == vmin:
+        return [np.ones((1, 1))]
+
+    step = (vmax - vmin) / num_levels
+    levels = np.clip(
+        np.floor((intensity - vmin) / step).astype(np.int32), 0, num_levels - 1
+    )
+
+    # Use only the 7 unique positive-shift directions (face + edge + corner)
+    pos_dirs = [
+        (1, 0, 0), (0, 1, 0), (0, 0, 1),
+        (1, 1, 0), (1, 0, 1), (0, 1, 1),
+        (1, 1, 1),
+    ]
+
+    glcms = []
+    for dx, dy, dz in pos_dirs:
+        # Current voxel region: must leave room for the shifted neighbour
+        x1, x2 = dx, intensity.shape[0]
+        y1, y2 = dy, intensity.shape[1]
+        z1, z2 = dz, intensity.shape[2]
+
+        sub_mask = (
+            mask[x1:x2, y1:y2, z1:z2]
+            & mask[x1 - dx:x2 - dx, y1 - dy:y2 - dy, z1 - dz:z2 - dz]
+        )
+        if not np.any(sub_mask):
+            glcms.append(np.zeros((num_levels, num_levels)))
+            continue
+
+        i0 = levels[x1:x2, y1:y2, z1:z2][sub_mask]
+        i1 = levels[x1 - dx:x2 - dx, y1 - dy:y2 - dy, z1 - dz:z2 - dz][sub_mask]
+
+        cm = np.bincount(i0 * num_levels + i1, minlength=num_levels * num_levels)
+        glcms.append(cm.reshape(num_levels, num_levels))
+
+    return glcms
+
+
+def compute_glcM_features(glcms: list[np.ndarray]) -> dict[str, float]:
+    """Compute texture features averaged across all 3D directions."""
+    if not glcms or all(np.sum(cm) == 0 for cm in glcms):
+        return {k: 0.0 for k in GLCM_KEYS}
+
+    # Normalize each GLCM to a probability matrix and average
+    n_dirs = len(glcms)
+    p_avg = np.zeros_like(glcms[0], dtype=np.float64)
+    for cm in glcms:
+        s = cm.sum()
+        if s > 0:
+            p_avg += cm.astype(np.float64) / s
+    p_avg /= n_dirs
+
+    n = p_avg.shape[0]
+    if n == 0 or p_avg.sum() == 0:
+        return {k: 0.0 for k in GLCM_KEYS}
+
+    # Precompute helpers
+    i, j = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    p_ij = p_avg
+    p_i = p_ij.sum(axis=1)
+    p_j = p_ij.sum(axis=0)
+    p_xy = p_i * p_j  # product of marginals (independent)
+
+    features: dict[str, float] = {}
+
+    # ASM / Energy
+    features["glcm_Energy"] = float(np.sum(p_ij ** 2))
+
+    # Contrast
+    features["glcm_Contrast"] = float(np.sum(
+        p_ij * ((i - j) ** 2)
+    ))
+
+    # Correlation
+    mu_x = float(np.sum(i * p_i))
+    mu_y = float(np.sum(j * p_j))
+    sigma_x = float(np.sqrt(np.sum(((i - mu_x) ** 2) * p_i)))
+    sigma_y = float(np.sqrt(np.sum(((j - mu_y) ** 2) * p_j)))
+    if sigma_x * sigma_y > 0:
+        features["glcm_Correlation"] = float(
+            np.sum(p_ij * (i - mu_x) * (j - mu_y)) / (sigma_x * sigma_y)
+        )
+    else:
+        features["glcm_Correlation"] = 0.0
+
+    # Homogeneity (Inverse Difference Moment)
+    features["glcm_Homogeneity"] = float(np.sum(p_ij / (1 + (i - j) ** 2)))
+
+    # Entropy
+    nonzero = p_ij > 0
+    features["glcm_Entropy"] = float(-np.sum(p_ij[nonzero] * np.log(p_ij[nonzero])))
+
+    # Idm Variance (variance of IDM)
+    idm = p_ij / (1 + (i - j) ** 2)
+    features["glcm_IdmVariance"] = float(np.var(idm))
+
+    # IMC1 (Informational Measure of Correlation #1)
+    hx = float(-np.sum(p_i * np.log(p_i + 1e-12)))
+    hy = float(-np.sum(p_j * np.log(p_j + 1e-12)))
+    hxy = features["glcm_Entropy"]
+    features["glcm_InformationMeasureCorrelation1"] = (
+        (hxy - max(hx, hy)) / max(abs(hxy), 1e-12) if hxy > 0 else 0.0
+    )
+
+    # IMC2 (Informational Measure of Correlation #2 / Maximal Coefficient of Correlation)
+    hxy_max = max(hx, hy)
+    features["glcm_InformationMeasureCorrelation2"] = (
+        (1 - np.exp(-2 * (hxy_max - hxy))) ** 0.5 if hxy_max > hxy else 0.0
+    )
+
+    return features
+
+
+GLCM_KEYS = [
+    "glcm_Contrast", "glcm_Correlation", "glcm_Energy",
+    "glcm_Homogeneity", "glcm_Entropy", "glcm_IdmVariance",
+    "glcm_InformationMeasureCorrelation1", "glcm_InformationMeasureCorrelation2",
+]
+
+
+# ---------------------------------------------------------------------------
+# GLRLM (3D)
+# ---------------------------------------------------------------------------
+
+def _compute_3d_glrlms(
+    intensity: np.ndarray,
+    mask: np.ndarray,
+    num_levels: int,
+) -> list[np.ndarray]:
+    """Compute 3D GLRLM matrices for each unique positive direction.
+
+    Uses the 7 unique positive shifts (face + edge + corner).
+    Returns a list of GLRLM matrices (one per direction), shape
+    (num_levels, max_run_length).
+    """
+    vmin, vmax = intensity[mask].min(), intensity[mask].max()
+    if vmax == vmin:
+        return [np.zeros((1, 1))]
+
+    step = (vmax - vmin) / num_levels
+    levels = np.clip(
+        np.floor((intensity - vmin) / step).astype(np.int32), 0, num_levels - 1
+    )
+
+    # 7 unique positive-shift directions (same set used for GLCM)
+    pos_dirs = [
+        (1, 0, 0), (0, 1, 0), (0, 0, 1),
+        (1, 1, 0), (1, 0, 1), (0, 1, 1),
+        (1, 1, 1),
+    ]
+
+    glrlms = []
+    max_possible_run = max(intensity.shape)
+
+    for dx, dy, dz in pos_dirs:
+        rlm = np.zeros((num_levels, max_possible_run), dtype=np.int64)
+
+        # Shifted mask: prev_mask[x] = mask[x - shift], so a run starts
+        # where mask is True but the predecessor (x - shift) is False or out of bounds.
+        prev_mask = np.zeros_like(mask)
+        if dx > 0:
+            prev_mask[dx:, :, :] = mask[:-dx, :, :]
+        if dy > 0:
+            prev_mask[:, dy:, :] = mask[:, :-dy, :]
+        if dz > 0:
+            prev_mask[:, :, dz:] = mask[:, :, :-dz]
+
+        # Run starts: in mask, but predecessor is NOT in mask
+        run_starts = mask & ~prev_mask
+
+        nz, ny, nx = np.where(run_starts)
+        for idx in range(len(nz)):
+            z0, y0, x0 = nz[idx], ny[idx], nx[idx]
+            gray = levels[x0, y0, z0]
+
+            # Trace the run forward
+            run_len = 0
+            x, y, z = x0, y0, z0
+            while 0 <= x < levels.shape[0] and \
+                  0 <= y < levels.shape[1] and \
+                  0 <= z < levels.shape[2] and \
+                  mask[x, y, z] and levels[x, y, z] == gray:
+                run_len += 1
+                x += dx
+                y += dy
+                z += dz
+                if run_len >= max_possible_run:
+                    break
+
+            if run_len > 0:
+                rlm[gray, run_len - 1] += 1
+
+        glrlms.append(rlm)
+
+    return glrlms
+
+
+def compute_glrlM_features(glrlms: list[np.ndarray]) -> dict[str, float]:
+    """Compute GLRLM texture features averaged across directions."""
+    if not glrlms or all(np.sum(rl) == 0 for rl in glrlms):
+        return {k: 0.0 for k in GLRLM_KEYS}
+
+    n_dirs = len(glrlms)
+    # Sum all RLMs and normalize
+    rlm_sum = np.zeros_like(glrlms[0], dtype=np.float64)
+    for rl in glrlms:
+        rlm_sum += rl.astype(np.float64)
+    total = rlm_sum.sum()
+    if total == 0:
+        return {k: 0.0 for k in GLRLM_KEYS}
+
+    p = rlm_sum / total
+    n_grays = p.shape[0]  # number of gray levels
+    n_runs = p.shape[1]   # max run length
+    gray_vals = np.arange(n_grays)
+    run_lens = np.arange(1, n_runs + 1)
+
+    features: dict[str, float] = {}
+
+    # RLE (Run Length Emphasis) = sum of l^2 * p(l, g)
+    features["glrlm_RunLengthEmphasis"] = float(np.sum(
+        p * (run_lens ** 2)[None, :]
+    ))
+
+    # SRE (Short Run Emphasis) = sum(p(l,g) / l^2) / N_gray
+    features["glrlm_ShortRunEmphasis"] = float(
+        np.sum(p / (run_lens[None, :] ** 2)) / n_grays
+    )
+
+    # LRE (Long Run Emphasis) = sum(l^2 * p(l,g)) / N_gray
+    features["glrlm_LongRunEmphasis"] = float(
+        np.sum((run_lens[None, :] ** 2) * p) / n_grays
+    )
+
+    # GLN (Gray Level Non-Uniformity)
+    p_g = p.sum(axis=1)  # gray level marginal
+    features["glrlm_GrayLevelNonUniformity"] = float(np.sqrt(np.sum(p_g ** 2)))
+
+    # RLN (Run Length Non-Uniformity)
+    p_l = p.sum(axis=0)
+    features["glrlm_RunLengthNonUniformity"] = float(np.sqrt(np.sum(p_l ** 2)))
+
+    # RLNNG (Run Length Non-Uniformity Normalized Gray)
+    features["glrlm_RunLengthNonUniformityNormalized"] = (
+        features["glrlm_RunLengthNonUniformity"] / np.sqrt(n_grays)
+        if n_grays > 0
+        else 0.0
+    )
+
+    # SRLGE (Short Run Large Gray Emphasis)
+    features["glrlm_ShortRunLargeGrayEmphasis"] = float(np.sum(
+        p * gray_vals[:, None] ** 2 / (run_lens[None, :] ** 2)
+    ))
+
+    # LRLGE (Long Run Large Gray Emphasis)
+    features["glrlm_LongRunLargeGrayEmphasis"] = float(np.sum(
+        p * gray_vals[:, None] ** 2 * (run_lens[None, :] ** 2)
+    ))
+
+    # RLGNonU (Run Length Gray-Level Non-Uniformity)
+    features["glrlm_RunLengthGrayLevelNonUniformity"] = float(np.sum(p ** 2))
+
+    # GLNonU (Gray-Level Non-Uniformity)
+    features["glrlm_GrayLevelVariance"] = float(np.sum(p_g ** 2))
+
+    return features
+
+
+GLRLM_KEYS = [
+    "glrlm_RunLengthEmphasis", "glrlm_ShortRunEmphasis", "glrlm_LongRunEmphasis",
+    "glrlm_GrayLevelNonUniformity", "glrlm_RunLengthNonUniformity",
+    "glrlm_RunLengthNonUniformityNormalized", "glrlm_ShortRunLargeGrayEmphasis",
+    "glrlm_LongRunLargeGrayEmphasis", "glrlm_RunLengthGrayLevelNonUniformity",
+    "glrlm_GrayLevelVariance",
+]
+
+
+# ---------------------------------------------------------------------------
+# GLZDM (3D)
+# ---------------------------------------------------------------------------
+
+def _compute_3d_glzdm(
+    intensity: np.ndarray,
+    mask: np.ndarray,
+    num_levels: int,
+) -> np.ndarray:
+    """Compute the 3D Gray Level Zone Dependency Matrix.
+
+    Uses the 7 unique positive-shift directions.
+    A 'zone' is a connected component of equal gray level voxels in a given
+    direction. GLZDM[z, g] = number of zones of length z at gray level g.
+    """
+    vmin, vmax = intensity[mask].min(), intensity[mask].max()
+    if vmax == vmin:
+        return np.zeros((1, 1))
+
+    step = (vmax - vmin) / num_levels
+    levels = np.clip(
+        np.floor((intensity - vmin) / step).astype(np.int32), 0, num_levels - 1
+    )
+
+    max_zone = max(intensity.shape)
+    glzdm = np.zeros((max_zone, num_levels), dtype=np.int64)
+
+    # 7 unique positive-shift directions
+    pos_dirs = [
+        (1, 0, 0), (0, 1, 0), (0, 0, 1),
+        (1, 1, 0), (1, 0, 1), (0, 1, 1),
+        (1, 1, 1),
+    ]
+
+    for dx, dy, dz in pos_dirs:
+        # Build the "previous voxel in direction" mask
+        prev_mask = np.zeros_like(mask)
+        if dx > 0:
+            prev_mask[dx:, :, :] = mask[:-dx, :, :]
+        if dy > 0:
+            prev_mask[:, dy:, :] = mask[:, :-dy, :]
+        if dz > 0:
+            prev_mask[:, :, dz:] = mask[:, :, :-dz]
+
+        zone_starts = mask & ~prev_mask
+        nz, ny, nx = np.where(zone_starts)
+
+        for idx in range(len(nz)):
+            z0, y0, x0 = nz[idx], ny[idx], nx[idx]
+            gray = levels[x0, y0, z0]
+            zone_len = 0
+            x, y, z = x0, y0, z0
+            while (0 <= x < levels.shape[0] and 0 <= y < levels.shape[1] and
+                   0 <= z < levels.shape[2] and mask[x, y, z] and
+                   levels[x, y, z] == gray):
+                zone_len += 1
+                x += dx
+                y += dy
+                z += dz
+                if zone_len >= max_zone:
+                    break
+            if zone_len > 0:
+                glzdm[zone_len - 1, gray] += 1
+
+    return glzdm
+
+
+def compute_glzdm_features(glzdm: np.ndarray) -> dict[str, float]:
+    """Compute GLZDM features."""
+    if glzdm.size == 0 or glzdm.sum() == 0:
+        return {k: 0.0 for k in GLZDM_KEYS}
+
+    total = glzdm.sum()
+    p = glzdm.astype(np.float64) / total
+    zone_lens = np.arange(1, p.shape[0] + 1)
+    gray_vals = np.arange(p.shape[1])
+
+    features: dict[str, float] = {}
+
+    # SZE (Small Dependence Emphasis)
+    features["gldm_SmallDependenceEmphasis"] = float(
+        np.sum(p / (zone_lens[:, None] ** 2))
+    )
+
+    # LZE (Large Dependence Emphasis)
+    features["gldm_LargeDependenceEmphasis"] = float(
+        np.sum(p * (zone_lens[:, None] ** 2))
+    )
+
+    # ZP (Zone Percentage) = 1 - sum(p^2)
+    features["gldm_DependencePercent"] = float(1.0 - np.sum(p ** 2))
+
+    # ZV (Zone Variance)
+    mean_z = float(np.sum(p * zone_lens[:, None]))
+    features["gldm_DependenceVariance"] = float(
+        np.sum(p * (zone_lens[:, None] - mean_z) ** 2)
+    )
+
+    # ZE (Zone Entropy)
+    nonzero = p > 0
+    features["gldm_DependenceEntropy"] = float(
+        -np.sum(p[nonzero] * np.log(p[nonzero]))
+    )
+
+    return features
+
+
+GLZDM_KEYS = [
+    "gldm_SmallDependenceEmphasis", "gldm_LargeDependenceEmphasis",
+    "gldm_DependencePercent", "gldm_DependenceVariance", "gldm_DependenceEntropy",
+]
+
+
+# ---------------------------------------------------------------------------
+# NGTDM
+# ---------------------------------------------------------------------------
+
+def compute_ngtdM_features(
+    intensity: np.ndarray,
+    mask: np.ndarray,
+    num_levels: int,
+) -> dict[str, float]:
+    """Compute NGTDM features.
+
+    For each masked voxel, the 'neighboring gray tone difference' is the
+    average gray level of its (face-adjacent) neighbors inside the mask,
+    minus the voxel's own gray level. The NGTDM is a histogram of these
+    differences.
+    """
+    vmin, vmax = intensity[mask].min(), intensity[mask].max()
+    if vmax == vmin:
+        return {k: 0.0 for k in NGTDM_KEYS}
+
+    # Compute face-neighbor sums and counts inside the mask
+    local_sum = np.zeros_like(intensity, dtype=np.float64)
+    local_count = np.zeros_like(mask, dtype=np.int32)
+    for dx, dy, dz in [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]:
+        if dx > 0:
+            lo, hi = dx, intensity.shape[0]
+        elif dx < 0:
+            lo, hi = 0, intensity.shape[0] + dx
+        else:
+            lo, hi = 0, intensity.shape[0]
+
+        if dy > 0:
+            lo2, hi2 = dy, intensity.shape[1]
+        elif dy < 0:
+            lo2, hi2 = 0, intensity.shape[1] + dy
+        else:
+            lo2, hi2 = 0, intensity.shape[1]
+
+        if dz > 0:
+            lo3, hi3 = dz, intensity.shape[2]
+        elif dz < 0:
+            lo3, hi3 = 0, intensity.shape[2] + dz
+        else:
+            lo3, hi3 = 0, intensity.shape[2]
+
+        local_sum[lo:hi, lo2:hi2, lo3:hi3] += intensity[
+            lo - dx:hi - dx, lo2 - dy:hi2 - dy, lo3 - dz:hi3 - dz
+        ]
+        local_count[lo:hi, lo2:hi2, lo3:hi3] += 1
+
+    # Neighborhood gray tone
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ngt = np.where(
+            local_count > 0,
+            local_sum / local_count - intensity,
+            0.0,
+        )
+
+    # Quantize the difference
+    ngt_flat = ngt[mask]
+    if ngt_flat.size == 0:
+        return {k: 0.0 for k in NGTDM_KEYS}
+
+    # Create histogram of NGT values (quantized)
+    n_bins = 100
+    ngt_min, ngt_max = ngt_flat.min(), ngt_flat.max()
+    if ngt_max == ngt_min:
+        return {k: 0.0 for k in NGTDM_KEYS}
+
+    # Bin the NGT values
+    ngt_quantized = np.clip(
+        np.floor((ngt_flat - ngt_min) / (ngt_max - ngt_min) * (n_bins - 1)).astype(np.int32),
+        0, n_bins - 1,
+    )
+    hist, _ = np.histogram(ngt_quantized, bins=n_bins)
+    p_ngt = hist / hist.sum() if hist.sum() > 0 else hist
+
+    features: dict[str, float] = {}
+    bin_centers = (np.arange(n_bins) + 0.5) * (ngt_max - ngt_min) / n_bins
+
+    # Coarseness = 1 / sum(p * |bin_center|)  (or similar)
+    abs_centers = np.abs(bin_centers)
+    denom = np.sum(p_ngt * abs_centers)
+    features["ngtdm_Coarseness"] = 1.0 / denom if denom > 0 else 0.0
+
+    # Contrast = sum(p * |bin_center|^2)
+    features["ngtdm_Contrast"] = float(np.sum(p_ngt * bin_centers ** 2))
+
+    # Complexity = sum(p * |bin_center| * sqrt(var))
+    mean_ngt = float(np.sum(p_ngt * bin_centers))
+    var_ngt = float(np.sum(p_ngt * (bin_centers - mean_ngt) ** 2))
+    features["ngtdm_Complexity"] = float(
+        np.sum(p_ngt * np.abs(bin_centers) * np.sqrt(var_ngt + 1e-12))
+    )
+
+    # Strength
+    features["ngtdm_Strength"] = float(
+        np.sum(p_ngt * np.sqrt(abs_centers + 1e-12))
+    )
+
+    # Granularity
+    features["ngtdm_Granularity"] = (
+        float(hist.max() / hist.sum()) if hist.sum() > 0 else 0.0
+    )
+
+    return features
+
+
+NGTDM_KEYS = [
+    "ngtdm_Coarseness", "ngtdm_Contrast", "ngtdm_Complexity",
+    "ngtdm_Strength", "ngtdm_Granularity",
+]
+
+
+# ---------------------------------------------------------------------------
+# Shannon entropy helper
+# ---------------------------------------------------------------------------
+
+def compute_shannon_entropy(values: np.ndarray, num_bins: int = 256) -> float:
+    """Shannon entropy of the intensity distribution."""
+    if values.size == 0:
+        return 0.0
+    hist, _ = np.histogram(values, bins=num_bins)
+    p = hist / hist.sum()
+    p = p[p > 0]
+    return float(-np.sum(p * np.log(p)))
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def compute_all_features(
+    volume_node,
+    segment_node,
+    num_levels: int = 256,
+) -> dict[str, Any]:
+    """Compute the full feature set for a volume/segment pair.
+
+    Returns a flat dictionary of feature name → value suitable for a table.
+    """
+    import slicer
+
+    mask, intensity, shape, spacing = extract_mask_and_intensity(
+        volume_node, segment_node
+    )
+
+    if not np.any(mask):
+        return {}
+
+    # Subset to masked voxels
+    values = intensity[mask]
+
+    # 1. First-order
+    features = compute_first_order(values)
+
+    # 2. Morphological
+    features.update(compute_morphological(shape, spacing, mask))
+
+    # 3. 3D GLCM
+    glcms = _compute_3d_glcms(intensity, mask, num_levels)
+    features.update(compute_glcM_features(glcms))
+
+    # 4. 3D GLRLM
+    glrlms = _compute_3d_glrlms(intensity, mask, num_levels)
+    features.update(compute_glrlM_features(glrlms))
+
+    # 5. 3D GLZDM
+    glzdm = _compute_3d_glzdm(intensity, mask, num_levels)
+    features.update(compute_glzdm_features(glzdm))
+
+    # 6. NGTDM
+    features.update(compute_ngtdM_features(intensity, mask, num_levels))
+
+    return features
