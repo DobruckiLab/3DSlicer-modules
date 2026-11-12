@@ -34,6 +34,20 @@ Splits a manually-drawn whole-hindlimb CT segmentation (left and/or right leg) i
 
 ---
 
+### [PADAnalysis2](PADAnalysis2/)
+
+Semi-automatic successor to PAD Analysis: builds a body mask from the CT automatically and, from **3 clicks per leg** (hip, knee, ankle), splits each hindlimb into **Proximal**, **Distal**, and **Foot** zones. It then reports PET uptake as **%ID/g**, **SUV**, and **ischemic / contralateral ratios**.
+
+- Automatic CT body mask (threshold, bed removal, largest connected component) on a configurable working grid
+- Zone cut planes derived from the landmarks; capture-radius and connectivity checks keep the tail and the other leg out
+- Proximal (thigh) zone bounded by a hip-level plane and an adjustable medial boundary, to exclude bladder / genital signal
+- Net dose with residual activity and optional decay correction (isotope presets); optional skin-margin erosion
+- Per-zone CSV plus ratio CSV with Subject ID, in append mode for whole cohorts
+
+**Module location in Slicer:** `Modules → Quantification → PAD Analysis 2`
+
+---
+
 ### [RadiomicsHeterogeneity](RadiomicsHeterogeneity/)
 
 Extracts **54 IBSI-standardised 3D radiomics features** from a CT or PET volume using a segmentation, capturing tumour heterogeneity through first-order statistics, co-occurrence, run-length, grey-level zone, and neighbourhood grey-level difference matrices — all computed in 3D.
