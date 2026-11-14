@@ -24,6 +24,7 @@ Workflow
                    shown as Slicer tables.
 
 Author: Wawrzyniec Dobrucki (EMIL, UIUC)
+Python coding with help of AI Tools (Claude Code)
 Slicer version: 5.x+
 """
 
